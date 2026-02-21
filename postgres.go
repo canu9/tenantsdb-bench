@@ -131,7 +131,7 @@ func RunPostgresOverhead(proxyCfg, directCfg ConnConfig, params BenchParams) {
 	if err != nil {
 			fmt.Printf("  ✗ Proxy connection failed: %v\n", err)
 			return
-		}
+		
 	}
 	defer proxyDB.Close()
 	fmt.Println("  ✓ Connected")
@@ -161,7 +161,7 @@ func RunPostgresThroughput(proxyCfg ConnConfig, params BenchParams) {
 	if err != nil {
 			fmt.Printf("  ✗ Connection failed: %v\n", err)
 			return
-		}
+		
 	}
 	defer db.Close()
 	fmt.Println("  ✓ Connected")
