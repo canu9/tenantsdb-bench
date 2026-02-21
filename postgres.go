@@ -1,36 +1,48 @@
 package main
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"math/rand"
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func pgDSN(c ConnConfig, sslmode string) string {
+func pgConnect(c ConnConfig, sslmode string) (*pgxpool.Pool, error) {
 	if sslmode == "" {
 		sslmode = "disable"
 	}
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		c.Host, c.Port, c.User, c.Password, c.Database, sslmode)
-}
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+		c.User, c.Password, c.Host, c.Port, c.Database, sslmode)
 
-func pgConnect(c ConnConfig, sslmode string) (*sql.DB, error) {
-	db, err := sql.Open("postgres", pgDSN(c, sslmode))
+	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(100)
-	db.SetMaxIdleConns(100)
-	return db, db.Ping()
+	config.MaxConns = 100
+	config.MinConns = 10
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return pool, nil
 }
 
-func pgSeedData(db *sql.DB, rows int) error {
+func pgSeedData(pool *pgxpool.Pool, rows int) error {
+	ctx := context.Background()
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&count)
+	err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM accounts").Scan(&count)
 	if err != nil {
 		return fmt.Errorf("seed check: %w", err)
 	}
@@ -40,7 +52,7 @@ func pgSeedData(db *sql.DB, rows int) error {
 	}
 
 	fmt.Printf("  Seeding %d rows...\n", rows)
-	_, err = db.Exec(fmt.Sprintf(`
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		INSERT INTO accounts (name, balance)
 		SELECT 'user_' || i, (random() * 10000)::decimal(15,2)
 		FROM generate_series(1, %d) i
@@ -49,14 +61,15 @@ func pgSeedData(db *sql.DB, rows int) error {
 	return err
 }
 
-func pgRunQueries(db *sql.DB, params BenchParams, label string) BenchStats {
+func pgRunQueries(pool *pgxpool.Pool, params BenchParams, label string) BenchStats {
+	ctx := context.Background()
 	maxID := params.SeedRows
 
 	// Warmup
 	fmt.Printf("  Warming up (%d queries)...\n", params.Warmup)
 	for i := 0; i < params.Warmup; i++ {
 		id := rand.Intn(maxID) + 1
-		db.QueryRow("SELECT id, name, balance FROM accounts WHERE id = $1", id).Scan(new(int), new(string), new(float64))
+		pool.QueryRow(ctx, "SELECT id, name, balance FROM accounts WHERE id = $1", id).Scan(new(int), new(string), new(float64))
 	}
 
 	// Benchmark
@@ -84,12 +97,12 @@ func pgRunQueries(db *sql.DB, params BenchParams, label string) BenchStats {
 					var rID int
 					var rName string
 					var rBalance float64
-					err := db.QueryRow("SELECT id, name, balance FROM accounts WHERE id = $1", id).Scan(&rID, &rName, &rBalance)
+					err := pool.QueryRow(ctx, "SELECT id, name, balance FROM accounts WHERE id = $1", id).Scan(&rID, &rName, &rBalance)
 					results[idx] = QueryResult{Duration: time.Since(qStart), Err: err}
 				} else {
 					id := rand.Intn(maxID) + 1
 					delta := rand.Float64()*200 - 100
-					_, err := db.Exec("UPDATE accounts SET balance = balance + $1 WHERE id = $2", delta, id)
+					_, err := pool.Exec(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", delta, id)
 					results[idx] = QueryResult{Duration: time.Since(qStart), Err: err}
 				}
 			}
@@ -109,17 +122,17 @@ func RunPostgresOverhead(proxyCfg, directCfg ConnConfig, params BenchParams) {
 
 	// Connect direct
 	fmt.Println("[1/4] Connecting directly to PostgreSQL...")
-	directDB, err := pgConnect(directCfg, "disable")
+	directPool, err := pgConnect(directCfg, "disable")
 	if err != nil {
 		fmt.Printf("  ✗ Direct connection failed: %v\n", err)
 		return
 	}
-	defer directDB.Close()
+	defer directPool.Close()
 	fmt.Println("  ✓ Connected")
 
 	// Seed data direct
 	fmt.Println("\n[2/4] Seeding test data (direct)...")
-	if err := pgSeedData(directDB, params.SeedRows); err != nil {
+	if err := pgSeedData(directPool, params.SeedRows); err != nil {
 		fmt.Printf("  ✗ Seed failed: %v\n", err)
 		return
 	}
@@ -127,23 +140,22 @@ func RunPostgresOverhead(proxyCfg, directCfg ConnConfig, params BenchParams) {
 
 	// Connect proxy
 	fmt.Println("\n[3/4] Connecting through TenantsDB proxy...")
-	proxyDB, err := pgConnect(proxyCfg, "disable")
+	proxyPool, err := pgConnect(proxyCfg, "disable")
 	if err != nil {
-			fmt.Printf("  ✗ Proxy connection failed: %v\n", err)
-			return
-		
+		fmt.Printf("  ✗ Proxy connection failed: %v\n", err)
+		return
 	}
-	defer proxyDB.Close()
+	defer proxyPool.Close()
 	fmt.Println("  ✓ Connected")
 
 	// Run benchmarks
 	fmt.Println("\n[4/4] Running benchmarks...")
 	fmt.Println("\n── Direct PostgreSQL ──")
-	directStats := pgRunQueries(directDB, params, "Direct PostgreSQL")
+	directStats := pgRunQueries(directPool, params, "Direct PostgreSQL")
 	PrintStats(directStats)
 
 	fmt.Println("\n── Through TenantsDB Proxy ──")
-	proxyStats := pgRunQueries(proxyDB, params, "Through TenantsDB Proxy")
+	proxyStats := pgRunQueries(proxyPool, params, "Through TenantsDB Proxy")
 	PrintStats(proxyStats)
 
 	// Comparison
@@ -157,23 +169,22 @@ func RunPostgresThroughput(proxyCfg ConnConfig, params BenchParams) {
 	fmt.Printf("  Queries: %d | Concurrency: %d\n\n", params.Queries, params.Concurrency)
 
 	fmt.Println("[1/3] Connecting through TenantsDB proxy...")
-	db, err := pgConnect(proxyCfg, "disable")
+	pool, err := pgConnect(proxyCfg, "disable")
 	if err != nil {
-			fmt.Printf("  ✗ Connection failed: %v\n", err)
-			return
-		
+		fmt.Printf("  ✗ Connection failed: %v\n", err)
+		return
 	}
-	defer db.Close()
+	defer pool.Close()
 	fmt.Println("  ✓ Connected")
 
 	fmt.Println("\n[2/3] Seeding test data...")
-	if err := pgSeedData(db, params.SeedRows); err != nil {
+	if err := pgSeedData(pool, params.SeedRows); err != nil {
 		fmt.Printf("  ✗ Seed failed: %v\n", err)
 		return
 	}
 	fmt.Println("  ✓ Data ready")
 
 	fmt.Println("\n[3/3] Running benchmark...")
-	stats := pgRunQueries(db, params, "PostgreSQL Throughput (via Proxy)")
+	stats := pgRunQueries(pool, params, "PostgreSQL Throughput (via Proxy)")
 	PrintStats(stats)
 }
