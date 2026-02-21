@@ -127,11 +127,8 @@ func RunPostgresOverhead(proxyCfg, directCfg ConnConfig, params BenchParams) {
 
 	// Connect proxy
 	fmt.Println("\n[3/4] Connecting through TenantsDB proxy...")
-	proxyDB, err := pgConnect(proxyCfg, "disable")
+	proxyDB, err := pgConnect(proxyCfg, "require")
 	if err != nil {
-		// Retry with SSL
-		proxyDB, err = pgConnect(proxyCfg, "require")
-		if err != nil {
 			fmt.Printf("  ✗ Proxy connection failed: %v\n", err)
 			return
 		}
@@ -160,10 +157,8 @@ func RunPostgresThroughput(proxyCfg ConnConfig, params BenchParams) {
 	fmt.Printf("  Queries: %d | Concurrency: %d\n\n", params.Queries, params.Concurrency)
 
 	fmt.Println("[1/3] Connecting through TenantsDB proxy...")
-	db, err := pgConnect(proxyCfg, "disable")
+	db, err := pgConnect(proxyCfg, "require")
 	if err != nil {
-		db, err = pgConnect(proxyCfg, "require")
-		if err != nil {
 			fmt.Printf("  ✗ Connection failed: %v\n", err)
 			return
 		}
