@@ -1,137 +1,184 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
-	"math"
-	"sort"
+	"math/rand"
+	"sync"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
-type ConnConfig struct {
-	Host     string
-	Port     int
-	User     string
-	Password string
-	Database string
+func pgDSN(c ConnConfig, sslmode string) string {
+	if sslmode == "" {
+		sslmode = "disable"
+	}
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		c.Host, c.Port, c.User, c.Password, c.Database, sslmode)
 }
 
-type BenchParams struct {
-	Queries     int
-	Concurrency int
-	Warmup      int
-	SeedRows    int
+func pgConnect(c ConnConfig, sslmode string) (*sql.DB, error) {
+	db, err := sql.Open("postgres", pgDSN(c, sslmode))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(100)
+	db.SetMaxIdleConns(100)
+	return db, db.Ping()
 }
 
-type QueryResult struct {
-	Duration time.Duration
-	Err      error
+func pgSeedData(db *sql.DB, rows int) error {
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&count)
+	if err != nil {
+		return fmt.Errorf("seed check: %w", err)
+	}
+	if count >= rows {
+		fmt.Printf("  Data already seeded (%d rows)\n", count)
+		return nil
+	}
+
+	fmt.Printf("  Seeding %d rows...\n", rows)
+	_, err = db.Exec(fmt.Sprintf(`
+		INSERT INTO accounts (name, balance)
+		SELECT 'user_' || i, (random() * 10000)::decimal(15,2)
+		FROM generate_series(1, %d) i
+		ON CONFLICT DO NOTHING
+	`, rows))
+	return err
 }
 
-type BenchStats struct {
-	Label       string
-	Total       int
-	Errors      int
-	Duration    time.Duration
-	QPS         float64
-	LatencyAvg  time.Duration
-	LatencyMin  time.Duration
-	LatencyMax  time.Duration
-	LatencyP50  time.Duration
-	LatencyP95  time.Duration
-	LatencyP99  time.Duration
+func pgRunQueries(db *sql.DB, params BenchParams, label string) BenchStats {
+	maxID := params.SeedRows
+
+	// Warmup
+	fmt.Printf("  Warming up (%d queries)...\n", params.Warmup)
+	for i := 0; i < params.Warmup; i++ {
+		id := rand.Intn(maxID) + 1
+		db.QueryRow("SELECT id, name, balance FROM accounts WHERE id = $1", id).Scan(new(int), new(string), new(float64))
+	}
+
+	// Benchmark
+	fmt.Printf("  Running %d queries (%d concurrent)...\n", params.Queries, params.Concurrency)
+
+	results := make([]QueryResult, params.Queries)
+	queriesPerWorker := params.Queries / params.Concurrency
+
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for w := 0; w < params.Concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			offset := workerID * queriesPerWorker
+
+			for i := 0; i < queriesPerWorker; i++ {
+				idx := offset + i
+				qStart := time.Now()
+
+				// 80% reads, 20% writes
+				if rand.Intn(100) < 80 {
+					id := rand.Intn(maxID) + 1
+					var rID int
+					var rName string
+					var rBalance float64
+					err := db.QueryRow("SELECT id, name, balance FROM accounts WHERE id = $1", id).Scan(&rID, &rName, &rBalance)
+					results[idx] = QueryResult{Duration: time.Since(qStart), Err: err}
+				} else {
+					id := rand.Intn(maxID) + 1
+					delta := rand.Float64()*200 - 100
+					_, err := db.Exec("UPDATE accounts SET balance = balance + $1 WHERE id = $2", delta, id)
+					results[idx] = QueryResult{Duration: time.Since(qStart), Err: err}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	totalDuration := time.Since(start)
+	return ComputeStats(label, results, totalDuration)
 }
 
-func ComputeStats(label string, results []QueryResult, totalDuration time.Duration) BenchStats {
-	stats := BenchStats{Label: label, Total: len(results), Duration: totalDuration}
+func RunPostgresOverhead(proxyCfg, directCfg ConnConfig, params BenchParams) {
+	fmt.Println("═══════════════════════════════════════════")
+	fmt.Println("  PostgreSQL Proxy Overhead Benchmark")
+	fmt.Println("═══════════════════════════════════════════")
+	fmt.Printf("  Queries: %d | Concurrency: %d | Workload: 80%% read / 20%% write\n\n", params.Queries, params.Concurrency)
 
-	var durations []time.Duration
-	for _, r := range results {
-		if r.Err != nil {
-			stats.Errors++
-			continue
+	// Connect direct
+	fmt.Println("[1/4] Connecting directly to PostgreSQL...")
+	directDB, err := pgConnect(directCfg, "disable")
+	if err != nil {
+		fmt.Printf("  ✗ Direct connection failed: %v\n", err)
+		return
+	}
+	defer directDB.Close()
+	fmt.Println("  ✓ Connected")
+
+	// Seed data direct
+	fmt.Println("\n[2/4] Seeding test data (direct)...")
+	if err := pgSeedData(directDB, params.SeedRows); err != nil {
+		fmt.Printf("  ✗ Seed failed: %v\n", err)
+		return
+	}
+	fmt.Println("  ✓ Data ready")
+
+	// Connect proxy
+	fmt.Println("\n[3/4] Connecting through TenantsDB proxy...")
+	proxyDB, err := pgConnect(proxyCfg, "disable")
+	if err != nil {
+		// Retry with SSL
+		proxyDB, err = pgConnect(proxyCfg, "require")
+		if err != nil {
+			fmt.Printf("  ✗ Proxy connection failed: %v\n", err)
+			return
 		}
-		durations = append(durations, r.Duration)
 	}
+	defer proxyDB.Close()
+	fmt.Println("  ✓ Connected")
 
-	if len(durations) == 0 {
-		return stats
-	}
+	// Run benchmarks
+	fmt.Println("\n[4/4] Running benchmarks...")
+	fmt.Println("\n── Direct PostgreSQL ──")
+	directStats := pgRunQueries(directDB, params, "Direct PostgreSQL")
+	PrintStats(directStats)
 
-	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	fmt.Println("\n── Through TenantsDB Proxy ──")
+	proxyStats := pgRunQueries(proxyDB, params, "Through TenantsDB Proxy")
+	PrintStats(proxyStats)
 
-	var sum time.Duration
-	for _, d := range durations {
-		sum += d
-	}
-
-	stats.LatencyAvg = sum / time.Duration(len(durations))
-	stats.LatencyMin = durations[0]
-	stats.LatencyMax = durations[len(durations)-1]
-	stats.LatencyP50 = percentile(durations, 50)
-	stats.LatencyP95 = percentile(durations, 95)
-	stats.LatencyP99 = percentile(durations, 99)
-	stats.QPS = float64(len(durations)) / totalDuration.Seconds()
-
-	return stats
+	// Comparison
+	PrintComparison(proxyStats, directStats)
 }
 
-func percentile(sorted []time.Duration, p float64) time.Duration {
-	if len(sorted) == 0 {
-		return 0
-	}
-	idx := int(math.Ceil(p/100*float64(len(sorted)))) - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
-	}
-	return sorted[idx]
-}
+func RunPostgresThroughput(proxyCfg ConnConfig, params BenchParams) {
+	fmt.Println("═══════════════════════════════════════════")
+	fmt.Println("  PostgreSQL Throughput Benchmark")
+	fmt.Println("═══════════════════════════════════════════")
+	fmt.Printf("  Queries: %d | Concurrency: %d\n\n", params.Queries, params.Concurrency)
 
-func PrintStats(s BenchStats) {
-	fmt.Printf("\n┌─────────────────────────────────────────┐\n")
-	fmt.Printf("│  %-39s│\n", s.Label)
-	fmt.Printf("├─────────────────────────────────────────┤\n")
-	fmt.Printf("│  Queries:      %-24d│\n", s.Total)
-	fmt.Printf("│  Errors:       %-24d│\n", s.Errors)
-	fmt.Printf("│  Duration:     %-24s│\n", s.Duration.Round(time.Millisecond))
-	fmt.Printf("│  QPS:          %-24.1f│\n", s.QPS)
-	fmt.Printf("├─────────────────────────────────────────┤\n")
-	fmt.Printf("│  Latency avg:  %-24s│\n", fmtDur(s.LatencyAvg))
-	fmt.Printf("│  Latency min:  %-24s│\n", fmtDur(s.LatencyMin))
-	fmt.Printf("│  Latency max:  %-24s│\n", fmtDur(s.LatencyMax))
-	fmt.Printf("│  Latency p50:  %-24s│\n", fmtDur(s.LatencyP50))
-	fmt.Printf("│  Latency p95:  %-24s│\n", fmtDur(s.LatencyP95))
-	fmt.Printf("│  Latency p99:  %-24s│\n", fmtDur(s.LatencyP99))
-	fmt.Printf("└─────────────────────────────────────────┘\n")
-}
-
-func PrintComparison(proxy, direct BenchStats) {
-	overhead := proxy.LatencyP50 - direct.LatencyP50
-	overheadPct := float64(overhead) / float64(direct.LatencyP50) * 100
-	qpsDrop := (direct.QPS - proxy.QPS) / direct.QPS * 100
-
-	fmt.Printf("\n╔═════════════════════════════════════════════════════════════╗\n")
-	fmt.Printf("║  PROXY OVERHEAD COMPARISON                                 ║\n")
-	fmt.Printf("╠═══════════════════╦════════════════╦════════════════════════╣\n")
-	fmt.Printf("║  Metric           ║  Direct        ║  Through Proxy         ║\n")
-	fmt.Printf("╠═══════════════════╬════════════════╬════════════════════════╣\n")
-	fmt.Printf("║  QPS              ║  %-13.1f ║  %-21.1f ║\n", direct.QPS, proxy.QPS)
-	fmt.Printf("║  Latency avg      ║  %-13s ║  %-21s ║\n", fmtDur(direct.LatencyAvg), fmtDur(proxy.LatencyAvg))
-	fmt.Printf("║  Latency p50      ║  %-13s ║  %-21s ║\n", fmtDur(direct.LatencyP50), fmtDur(proxy.LatencyP50))
-	fmt.Printf("║  Latency p95      ║  %-13s ║  %-21s ║\n", fmtDur(direct.LatencyP95), fmtDur(proxy.LatencyP95))
-	fmt.Printf("║  Latency p99      ║  %-13s ║  %-21s ║\n", fmtDur(direct.LatencyP99), fmtDur(proxy.LatencyP99))
-	fmt.Printf("╠═══════════════════╩════════════════╩════════════════════════╣\n")
-	fmt.Printf("║  Proxy Overhead (p50):  %-35s ║\n", fmt.Sprintf("%s (%.1f%%)", fmtDur(overhead), overheadPct))
-	fmt.Printf("║  QPS Drop:              %-35s ║\n", fmt.Sprintf("%.1f%%", qpsDrop))
-	fmt.Printf("╚═════════════════════════════════════════════════════════════╝\n")
-}
-
-func fmtDur(d time.Duration) string {
-	us := float64(d.Microseconds())
-	if us < 1000 {
-		return fmt.Sprintf("%.0fµs", us)
+	fmt.Println("[1/3] Connecting through TenantsDB proxy...")
+	db, err := pgConnect(proxyCfg, "disable")
+	if err != nil {
+		db, err = pgConnect(proxyCfg, "require")
+		if err != nil {
+			fmt.Printf("  ✗ Connection failed: %v\n", err)
+			return
+		}
 	}
-	return fmt.Sprintf("%.2fms", us/1000)
+	defer db.Close()
+	fmt.Println("  ✓ Connected")
+
+	fmt.Println("\n[2/3] Seeding test data...")
+	if err := pgSeedData(db, params.SeedRows); err != nil {
+		fmt.Printf("  ✗ Seed failed: %v\n", err)
+		return
+	}
+	fmt.Println("  ✓ Data ready")
+
+	fmt.Println("\n[3/3] Running benchmark...")
+	stats := pgRunQueries(db, params, "PostgreSQL Throughput (via Proxy)")
+	PrintStats(stats)
 }
