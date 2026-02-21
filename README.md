@@ -1,50 +1,103 @@
 # TenantsDB Benchmark
 
-Measures proxy overhead, throughput, and latency for TenantsDB.
+Measures proxy overhead, throughput, and latency across TenantsDB's database proxy layer.
+
+## What It Tests
+
+- **Proxy Overhead** — How much latency does the TenantsDB proxy add vs a direct database connection?
+- **Throughput** — How many queries per second can a tenant sustain through the proxy?
+- **Latency Distribution** — p50, p95, p99 latency under concurrent load
+
+## Workload
+
+80% reads (SELECT by primary key) / 20% writes (UPDATE balance). Configurable concurrency and query count.
 
 ## Setup
 
 ```bash
-# On node02
-git clone <repo-url> ~/tenantsdb-bench
-cd ~/tenantsdb-bench
+git clone <repo-url>
+cd tenantsdb-bench
 go mod tidy
 go build -o bench .
 ```
 
-## Test 1: Proxy Overhead (Direct vs Proxied)
+## Usage
 
 ```bash
-./bench \
-  -test overhead \
-  -proxy-host 192.168.60.13 \
-  -proxy-port 30432 \
-  -proxy-user tdb_24cbcee9 \
-  -proxy-pass tdb_7288175b98bafbae \
-  -proxy-db bench_pg__bench01 \
-  -direct-host 192.168.60.12 \
-  -direct-port 5432 \
-  -direct-user <pg_user> \
-  -direct-pass <pg_pass> \
-  -direct-db bench_pg__bench01 \
-  -queries 10000 \
-  -concurrency 10
+# Proxy overhead: compares direct DB vs through proxy
+./bench -test overhead \
+  -proxy-host <proxy-ip> -proxy-port <port> \
+  -proxy-user <project-id> -proxy-pass <proxy-password> \
+  -proxy-db <tenant-database> \
+  -direct-host <db-ip> -direct-port <port> \
+  -direct-user <db-user> -direct-pass <db-password> \
+  -direct-db <tenant-database>
+
+# Throughput only: measures QPS through proxy
+./bench -test throughput \
+  -proxy-host <proxy-ip> -proxy-port <port> \
+  -proxy-user <project-id> -proxy-pass <proxy-password> \
+  -proxy-db <tenant-database>
 ```
 
-## Test 2: Throughput Only
+## Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-db` | postgres | Database type: postgres, mysql, mongodb, redis |
+| `-test` | overhead | Test type: overhead, throughput |
+| `-queries` | 10000 | Total queries to run |
+| `-concurrency` | 10 | Parallel connections |
+| `-warmup` | 100 | Warmup queries before measuring |
+| `-seed-rows` | 10000 | Rows to insert for test data |# TenantsDB Benchmark
+
+Measures proxy overhead, throughput, and latency across TenantsDB's database proxy layer.
+
+## What It Tests
+
+- **Proxy Overhead** — How much latency does the TenantsDB proxy add vs a direct database connection?
+- **Throughput** — How many queries per second can a tenant sustain through the proxy?
+- **Latency Distribution** — p50, p95, p99 latency under concurrent load
+
+## Workload
+
+80% reads (SELECT by primary key) / 20% writes (UPDATE balance). Configurable concurrency and query count.
+
+## Setup
 
 ```bash
-./bench \
-  -test throughput \
-  -proxy-host 192.168.60.13 \
-  -proxy-port 30432 \
-  -proxy-user tdb_24cbcee9 \
-  -proxy-pass tdb_7288175b98bafbae \
-  -proxy-db bench_pg__bench01 \
-  -queries 50000 \
-  -concurrency 50
+git clone <repo-url>
+cd tenantsdb-bench
+go mod tidy
+go build -o bench .
 ```
 
-## Output
+## Usage
 
-Produces latency distribution (p50/p95/p99), QPS, and proxy overhead comparison.
+```bash
+# Proxy overhead: compares direct DB vs through proxy
+./bench -test overhead \
+  -proxy-host <proxy-ip> -proxy-port <port> \
+  -proxy-user <project-id> -proxy-pass <proxy-password> \
+  -proxy-db <tenant-database> \
+  -direct-host <db-ip> -direct-port <port> \
+  -direct-user <db-user> -direct-pass <db-password> \
+  -direct-db <tenant-database>
+
+# Throughput only: measures QPS through proxy
+./bench -test throughput \
+  -proxy-host <proxy-ip> -proxy-port <port> \
+  -proxy-user <project-id> -proxy-pass <proxy-password> \
+  -proxy-db <tenant-database>
+```
+
+## Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-db` | postgres | Database type: postgres, mysql, mongodb, redis |
+| `-test` | overhead | Test type: overhead, throughput |
+| `-queries` | 10000 | Total queries to run |
+| `-concurrency` | 10 | Parallel connections |
+| `-warmup` | 100 | Warmup queries before measuring |
+| `-seed-rows` | 10000 | Rows to insert for test data |
