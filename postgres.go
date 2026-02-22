@@ -419,13 +419,13 @@ func RunPostgresIsolation(proxyCfg ConnConfig, params BenchParams) {
 	fmt.Println("║  Metric           ║  Alone         ║  Under Noise           ║")
 	fmt.Println("╠═══════════════════╬════════════════╬════════════════════════╣")
 	fmt.Printf("║  QPS              ║  %-13.1f ║  %-23.1f║\n", baselineStats.QPS, noiseStats.QPS)
-	fmt.Printf("║  Latency avg      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.Avg), fmtDuration(noiseStats.Avg))
-	fmt.Printf("║  Latency p50      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.P50), fmtDuration(noiseStats.P50))
-	fmt.Printf("║  Latency p95      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.P95), fmtDuration(noiseStats.P95))
-	fmt.Printf("║  Latency p99      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.P99), fmtDuration(noiseStats.P99))
+	fmt.Printf("║  Latency avg      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.LatencyAvg), fmtDuration(noiseStats.LatencyAvg))
+	fmt.Printf("║  Latency p50      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.LatencyP50), fmtDuration(noiseStats.LatencyP50))
+	fmt.Printf("║  Latency p95      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.LatencyP95), fmtDuration(noiseStats.LatencyP95))
+	fmt.Printf("║  Latency p99      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.LatencyP99), fmtDuration(noiseStats.LatencyP99))
 	fmt.Println("╠═══════════════════╩════════════════╩════════════════════════╣")
 
-	p50Diff := float64(noiseStats.P50-baselineStats.P50) / float64(baselineStats.P50) * 100
+	p50Diff := float64(noiseStats.LatencyP50-baselineStats.LatencyP50) / float64(baselineStats.LatencyP50) * 100
 	fmt.Printf("║  P50 Impact: %+.1f%%", p50Diff)
 	if p50Diff < 20 {
 		fmt.Print("  ✅ ISOLATED")
