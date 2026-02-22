@@ -98,6 +98,8 @@ func main() {
 			RunPostgresThroughput(proxyCfg, params)
 		case "multi":
 			RunPostgresMultiTenant(proxyCfg, params)
+		case "isolation":
+			RunPostgresIsolation(proxyCfg, params)
 		default:
 			fmt.Printf("Unknown test type: %s\n", *testType)
 			os.Exit(1)

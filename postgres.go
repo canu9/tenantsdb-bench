@@ -299,3 +299,148 @@ func RunPostgresMultiTenant(proxyCfg ConnConfig, params BenchParams) {
 		results, totalDuration)
 	PrintStats(stats)
 }
+
+func RunPostgresIsolation(proxyCfg ConnConfig, params BenchParams) {
+	victim := "bench_pg__bench01"
+	noisy := []string{
+		"bench_pg__bench02", "bench_pg__bench03", "bench_pg__bench04",
+		"bench_pg__bench05", "bench_pg__bench06", "bench_pg__bench07",
+		"bench_pg__bench08", "bench_pg__bench09", "bench_pg__bench10",
+	}
+
+	fmt.Println("═══════════════════════════════════════════")
+	fmt.Println("  PostgreSQL Noisy Neighbor Isolation Test")
+	fmt.Println("═══════════════════════════════════════════")
+	fmt.Printf("  Victim tenant: %s\n", victim)
+	fmt.Printf("  Noisy tenants: %d (each hammering with writes)\n\n", len(noisy))
+
+	// Connect victim
+	fmt.Println("[1/3] Connecting victim tenant...")
+	victimCfg := proxyCfg
+	victimCfg.Database = victim
+	victimPool, err := pgConnect(victimCfg, "disable")
+	if err != nil {
+		fmt.Printf("  ✗ Failed: %v\n", err)
+		return
+	}
+	defer victimPool.Close()
+	if err := pgSeedData(victimPool, params.SeedRows); err != nil {
+		fmt.Printf("  ✗ Seed failed: %v\n", err)
+		return
+	}
+	fmt.Println("  ✓ Victim ready")
+
+	// Connect noisy tenants
+	fmt.Println("\n[2/3] Connecting noisy tenants...")
+	noisyPools := make([]*pgxpool.Pool, len(noisy))
+	for i, t := range noisy {
+		cfg := proxyCfg
+		cfg.Database = t
+		pool, err := pgConnect(cfg, "disable")
+		if err != nil {
+			fmt.Printf("  ✗ %s failed: %v\n", t, err)
+			return
+		}
+		defer pool.Close()
+		noisyPools[i] = pool
+
+		if err := pgSeedData(pool, params.SeedRows); err != nil {
+			fmt.Printf("  ✗ Seed %s failed: %v\n", t, err)
+			return
+		}
+	}
+	fmt.Println("  ✓ All noisy tenants ready")
+
+	fmt.Println("\n[3/3] Running isolation test...")
+	maxID := params.SeedRows
+	victimQueries := params.Queries
+	victimConc := 5
+
+	// ── Phase 1: Victim alone ──
+	fmt.Println("\n── Phase 1: Victim alone (no noise) ──")
+	baselineStats := pgRunQueries(victimPool, BenchParams{
+		Queries:     victimQueries,
+		Concurrency: victimConc,
+		Warmup:      params.Warmup,
+		SeedRows:    params.SeedRows,
+	}, "Victim ALONE")
+	PrintStats(baselineStats)
+
+	// ── Phase 2: Victim under noise ──
+	fmt.Println("\n── Phase 2: Starting noisy neighbors ──")
+	fmt.Printf("  Launching %d noisy tenants (heavy writes)...\n", len(noisy))
+
+	stopNoise := make(chan struct{})
+	var noiseWg sync.WaitGroup
+
+	// Start noisy workers — 5 concurrent per tenant, 100% writes
+	for _, pool := range noisyPools {
+		for w := 0; w < 5; w++ {
+			noiseWg.Add(1)
+			go func(p *pgxpool.Pool) {
+				defer noiseWg.Done()
+				ctx := context.Background()
+				for {
+					select {
+					case <-stopNoise:
+						return
+					default:
+						id := rand.Intn(maxID) + 1
+						delta := rand.Float64()*200 - 100
+						p.Exec(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", delta, id)
+					}
+				}
+			}(pool)
+		}
+	}
+
+	// Let noise ramp up
+	time.Sleep(2 * time.Second)
+	fmt.Println("  ✓ Noise running (9 tenants × 5 concurrent = 45 writers)")
+
+	fmt.Println("\n── Measuring victim under noise ──")
+	noiseStats := pgRunQueries(victimPool, BenchParams{
+		Queries:     victimQueries,
+		Concurrency: victimConc,
+		Warmup:      params.Warmup,
+		SeedRows:    params.SeedRows,
+	}, "Victim UNDER NOISE")
+	PrintStats(noiseStats)
+
+	// Stop noise
+	close(stopNoise)
+	noiseWg.Wait()
+
+	// ── Comparison ──
+	fmt.Println()
+	fmt.Println("╔═════════════════════════════════════════════════════════════╗")
+	fmt.Println("║  NOISY NEIGHBOR ISOLATION RESULTS                          ║")
+	fmt.Println("╠═══════════════════╦════════════════╦════════════════════════╣")
+	fmt.Println("║  Metric           ║  Alone         ║  Under Noise           ║")
+	fmt.Println("╠═══════════════════╬════════════════╬════════════════════════╣")
+	fmt.Printf("║  QPS              ║  %-13.1f ║  %-23.1f║\n", baselineStats.QPS, noiseStats.QPS)
+	fmt.Printf("║  Latency avg      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.Avg), fmtDuration(noiseStats.Avg))
+	fmt.Printf("║  Latency p50      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.P50), fmtDuration(noiseStats.P50))
+	fmt.Printf("║  Latency p95      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.P95), fmtDuration(noiseStats.P95))
+	fmt.Printf("║  Latency p99      ║  %-13s ║  %-23s║\n", fmtDuration(baselineStats.P99), fmtDuration(noiseStats.P99))
+	fmt.Println("╠═══════════════════╩════════════════╩════════════════════════╣")
+
+	p50Diff := float64(noiseStats.P50-baselineStats.P50) / float64(baselineStats.P50) * 100
+	fmt.Printf("║  P50 Impact: %+.1f%%", p50Diff)
+	if p50Diff < 20 {
+		fmt.Print("  ✅ ISOLATED")
+	} else if p50Diff < 50 {
+		fmt.Print("  ⚠️  MODERATE IMPACT")
+	} else {
+		fmt.Print("  ❌ NOISY NEIGHBOR DETECTED")
+	}
+	fmt.Println()
+	fmt.Println("╚═════════════════════════════════════════════════════════════╝")
+}
+
+func fmtDuration(d time.Duration) string {
+	if d < time.Millisecond {
+		return fmt.Sprintf("%.0fµs", float64(d.Microseconds()))
+	}
+	return fmt.Sprintf("%.2fms", float64(d.Microseconds())/1000)
+}
