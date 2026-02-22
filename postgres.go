@@ -301,7 +301,7 @@ func RunPostgresMultiTenant(proxyCfg ConnConfig, params BenchParams) {
 }
 
 func RunPostgresIsolation(proxyCfg ConnConfig, params BenchParams) {
-	victim := "bench_pg__bench01"
+	victim := proxyCfg.Database
 	noisy := []string{
 		"bench_pg__bench02", "bench_pg__bench03", "bench_pg__bench04",
 		"bench_pg__bench05", "bench_pg__bench06", "bench_pg__bench07",
