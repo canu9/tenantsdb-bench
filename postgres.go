@@ -21,8 +21,8 @@ func pgConnect(c ConnConfig, sslmode string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	config.MaxConns = 100
-	config.MinConns = 10
+	config.MaxConns = 10
+	config.MinConns = 2
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -111,6 +111,16 @@ func pgRunQueries(pool *pgxpool.Pool, params BenchParams, label string) BenchSta
 	wg.Wait()
 
 	totalDuration := time.Since(start)
+
+	// Log first few errors
+	errCount := 0
+	for _, r := range results {
+		if r.Err != nil && errCount < 5 {
+			fmt.Printf("  ⚠ Error: %v\n", r.Err)
+			errCount++
+		}
+	}
+
 	return ComputeStats(label, results, totalDuration)
 }
 
