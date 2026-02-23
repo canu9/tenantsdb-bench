@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tenantsdb-bench/bench"
@@ -63,6 +64,7 @@ func SeedData(pool *pgxpool.Pool, rows int) error {
 	return err
 }
 
+// RunQueries runs a fixed number of queries (count-based mode).
 func RunQueries(pool *pgxpool.Pool, params bench.BenchParams, label string) bench.BenchStats {
 	ctx := context.Background()
 	maxID := params.SeedRows
@@ -93,7 +95,6 @@ func RunQueries(pool *pgxpool.Pool, params bench.BenchParams, label string) benc
 				idx := offset + i
 				qStart := time.Now()
 
-				// 80% reads, 20% writes
 				if rand.Intn(100) < 80 {
 					id := rand.Intn(maxID) + 1
 					var rID int
@@ -114,7 +115,6 @@ func RunQueries(pool *pgxpool.Pool, params bench.BenchParams, label string) benc
 
 	totalDuration := time.Since(start)
 
-	// Log first few errors
 	errCount := 0
 	for _, r := range results {
 		if r.Err != nil && errCount < 5 {
@@ -124,4 +124,85 @@ func RunQueries(pool *pgxpool.Pool, params bench.BenchParams, label string) benc
 	}
 
 	return bench.ComputeStats(label, results, totalDuration)
+}
+
+// RunQueriesTimed runs queries for a fixed duration (time-based mode).
+// Returns results collected during the duration window.
+func RunQueriesTimed(pool *pgxpool.Pool, params bench.BenchParams, label string) bench.BenchStats {
+	if params.Duration <= 0 {
+		return RunQueries(pool, params, label)
+	}
+
+	ctx := context.Background()
+	maxID := params.SeedRows
+
+	// Warmup
+	fmt.Printf("  Warming up (%d queries)...\n", params.Warmup)
+	for i := 0; i < params.Warmup; i++ {
+		id := rand.Intn(maxID) + 1
+		pool.QueryRow(ctx, "SELECT id, name, balance FROM accounts WHERE id = $1", id).Scan(new(int), new(string), new(float64))
+	}
+
+	fmt.Printf("  Running for %s (%d concurrent)...\n", params.Duration, params.Concurrency)
+
+	var mu sync.Mutex
+	var results []bench.QueryResult
+	var stopped atomic.Bool
+
+	start := time.Now()
+
+	// Stop signal after duration
+	time.AfterFunc(params.Duration, func() { stopped.Store(true) })
+
+	var wg sync.WaitGroup
+	for w := 0; w < params.Concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var local []bench.QueryResult
+
+			for !stopped.Load() {
+				qStart := time.Now()
+
+				if rand.Intn(100) < 80 {
+					id := rand.Intn(maxID) + 1
+					var rID int
+					var rName string
+					var rBalance float64
+					err := pool.QueryRow(ctx, "SELECT id, name, balance FROM accounts WHERE id = $1", id).Scan(&rID, &rName, &rBalance)
+					local = append(local, bench.QueryResult{At: qStart, Duration: time.Since(qStart), Err: err})
+				} else {
+					id := rand.Intn(maxID) + 1
+					delta := rand.Float64()*200 - 100
+					_, err := pool.Exec(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", delta, id)
+					local = append(local, bench.QueryResult{At: qStart, Duration: time.Since(qStart), Err: err})
+				}
+			}
+
+			mu.Lock()
+			results = append(results, local...)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	totalDuration := time.Since(start)
+
+	errCount := 0
+	for _, r := range results {
+		if r.Err != nil && errCount < 5 {
+			fmt.Printf("  ⚠ Error: %v\n", r.Err)
+			errCount++
+		}
+	}
+
+	return bench.ComputeStats(label, results, totalDuration)
+}
+
+// PickRunner returns the right runner based on params.Duration.
+func PickRunner(pool *pgxpool.Pool, params bench.BenchParams, label string) bench.BenchStats {
+	if params.Duration > 0 {
+		return RunQueriesTimed(pool, params, label)
+	}
+	return RunQueries(pool, params, label)
 }

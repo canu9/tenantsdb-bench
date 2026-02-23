@@ -10,7 +10,11 @@ func RunOverhead(proxyCfg, directCfg bench.ConnConfig, params bench.BenchParams)
 	fmt.Println("═══════════════════════════════════════════")
 	fmt.Println("  PostgreSQL Proxy Overhead Benchmark")
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Printf("  Queries: %d | Concurrency: %d | Workload: 80%% read / 20%% write\n\n", params.Queries, params.Concurrency)
+	if params.Duration > 0 {
+		fmt.Printf("  Duration: %s | Concurrency: %d | Workload: 80%% read / 20%% write\n\n", params.Duration, params.Concurrency)
+	} else {
+		fmt.Printf("  Queries: %d | Concurrency: %d | Workload: 80%% read / 20%% write\n\n", params.Queries, params.Concurrency)
+	}
 
 	// Connect direct
 	fmt.Println("[1/4] Connecting directly to PostgreSQL...")
@@ -42,23 +46,43 @@ func RunOverhead(proxyCfg, directCfg bench.ConnConfig, params bench.BenchParams)
 
 	// Run benchmarks
 	fmt.Println("\n[4/4] Running benchmarks...")
-	fmt.Println("\n── Direct PostgreSQL ──")
-	directStats := RunQueries(directPool, params, "Direct PostgreSQL")
-	bench.PrintStats(directStats)
 
-	fmt.Println("\n── Through TenantsDB Proxy ──")
-	proxyStats := RunQueries(proxyPool, params, "Through TenantsDB Proxy")
-	bench.PrintStats(proxyStats)
+	if params.Runs > 1 {
+		// Multi-run mode: 5 runs each, median reported
+		directStats := bench.RunMultiple(params.Runs, "Direct PostgreSQL", func(run int) bench.BenchStats {
+			return PickRunner(directPool, params, "Direct PostgreSQL")
+		})
+		bench.PrintStats(directStats)
 
-	// Comparison
-	bench.PrintComparison(proxyStats, directStats)
+		proxyStats := bench.RunMultiple(params.Runs, "Through TenantsDB Proxy", func(run int) bench.BenchStats {
+			return PickRunner(proxyPool, params, "Through TenantsDB Proxy")
+		})
+		bench.PrintStats(proxyStats)
+
+		bench.PrintComparison(proxyStats, directStats)
+	} else {
+		// Single run
+		fmt.Println("\n── Direct PostgreSQL ──")
+		directStats := PickRunner(directPool, params, "Direct PostgreSQL")
+		bench.PrintStats(directStats)
+
+		fmt.Println("\n── Through TenantsDB Proxy ──")
+		proxyStats := PickRunner(proxyPool, params, "Through TenantsDB Proxy")
+		bench.PrintStats(proxyStats)
+
+		bench.PrintComparison(proxyStats, directStats)
+	}
 }
 
 func RunThroughput(proxyCfg bench.ConnConfig, params bench.BenchParams) {
 	fmt.Println("═══════════════════════════════════════════")
 	fmt.Println("  PostgreSQL Throughput Benchmark")
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Printf("  Queries: %d | Concurrency: %d\n\n", params.Queries, params.Concurrency)
+	if params.Duration > 0 {
+		fmt.Printf("  Duration: %s | Concurrency: %d\n\n", params.Duration, params.Concurrency)
+	} else {
+		fmt.Printf("  Queries: %d | Concurrency: %d\n\n", params.Queries, params.Concurrency)
+	}
 
 	fmt.Println("[1/3] Connecting through TenantsDB proxy...")
 	pool, err := Connect(proxyCfg, "disable")
@@ -77,6 +101,14 @@ func RunThroughput(proxyCfg bench.ConnConfig, params bench.BenchParams) {
 	fmt.Println("  ✓ Data ready")
 
 	fmt.Println("\n[3/3] Running benchmark...")
-	stats := RunQueries(pool, params, "PostgreSQL Throughput (via Proxy)")
-	bench.PrintStats(stats)
+
+	if params.Runs > 1 {
+		stats := bench.RunMultiple(params.Runs, "PostgreSQL Throughput (via Proxy)", func(run int) bench.BenchStats {
+			return PickRunner(pool, params, "PostgreSQL Throughput (via Proxy)")
+		})
+		bench.PrintStats(stats)
+	} else {
+		stats := PickRunner(pool, params, "PostgreSQL Throughput (via Proxy)")
+		bench.PrintStats(stats)
+	}
 }

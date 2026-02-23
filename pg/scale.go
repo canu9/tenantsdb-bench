@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tenantsdb-bench/bench"
@@ -37,10 +38,6 @@ func RunScale(proxyCfg bench.ConnConfig, params bench.BenchParams) {
 		concPerTenant = 1
 	}
 	totalConc := concPerTenant * len(tenants)
-	queriesPerTenant := params.Queries / len(tenants)
-	if queriesPerTenant < 10 {
-		queriesPerTenant = 10
-	}
 
 	fmt.Println("═══════════════════════════════════════════")
 	fmt.Println("  PostgreSQL Scale Benchmark (100 Tenants)")
@@ -48,8 +45,16 @@ func RunScale(proxyCfg bench.ConnConfig, params bench.BenchParams) {
 	fmt.Printf("  Tenants:             %d\n", len(tenants))
 	fmt.Printf("  Concurrency/tenant:  %d\n", concPerTenant)
 	fmt.Printf("  Total concurrency:   %d\n", totalConc)
-	fmt.Printf("  Queries/tenant:      %d\n", queriesPerTenant)
-	fmt.Printf("  Total queries:       %d\n", queriesPerTenant*len(tenants))
+	if params.Duration > 0 {
+		fmt.Printf("  Duration:            %s\n", params.Duration)
+	} else {
+		queriesPerTenant := params.Queries / len(tenants)
+		if queriesPerTenant < 10 {
+			queriesPerTenant = 10
+		}
+		fmt.Printf("  Queries/tenant:      %d\n", queriesPerTenant)
+		fmt.Printf("  Total queries:       %d\n", queriesPerTenant*len(tenants))
+	}
 	fmt.Printf("  Workload:            80%% read / 20%% write\n\n")
 
 	// ── Phase 1: Connect all tenants ──
@@ -111,7 +116,29 @@ func RunScale(proxyCfg bench.ConnConfig, params bench.BenchParams) {
 	fmt.Println("[3/3] Running scale benchmark...")
 	fmt.Println()
 
+	runOnce := func(run int) bench.BenchStats {
+		if params.Duration > 0 {
+			return scaleRunTimed(pools, tenants, params, concPerTenant, totalConc)
+		}
+		return scaleRunCount(pools, tenants, params, concPerTenant, totalConc)
+	}
+
+	if params.Runs > 1 {
+		stats := bench.RunMultiple(params.Runs, "Scale (100 tenants)", runOnce)
+		bench.PrintStats(stats)
+	} else {
+		stats := runOnce(0)
+		bench.PrintStats(stats)
+	}
+}
+
+func scaleRunCount(pools []*pgxpool.Pool, tenants []string, params bench.BenchParams, concPerTenant, totalConc int) bench.BenchStats {
 	maxID := params.SeedRows
+	queriesPerTenant := params.Queries / len(tenants)
+	if queriesPerTenant < 10 {
+		queriesPerTenant = 10
+	}
+
 	tResults := make([]tenantStats, len(tenants))
 	for i, t := range tenants {
 		tResults[i] = tenantStats{
@@ -162,8 +189,74 @@ func RunScale(proxyCfg bench.ConnConfig, params bench.BenchParams) {
 	wg.Wait()
 
 	totalDuration := time.Since(start)
+	return computeScaleStats(tResults, pools, tenants, totalDuration, totalConc)
+}
 
-	// ── Compute per-tenant stats ──
+func scaleRunTimed(pools []*pgxpool.Pool, tenants []string, params bench.BenchParams, concPerTenant, totalConc int) bench.BenchStats {
+	maxID := params.SeedRows
+
+	// Per-tenant result collection with per-tenant mutex
+	type tenantCollector struct {
+		mu      sync.Mutex
+		results []bench.QueryResult
+	}
+	collectors := make([]tenantCollector, len(tenants))
+
+	var stopped atomic.Bool
+	start := time.Now()
+	time.AfterFunc(params.Duration, func() { stopped.Store(true) })
+
+	var wg sync.WaitGroup
+	for t := 0; t < len(tenants); t++ {
+		pool := pools[t]
+		if pool == nil {
+			continue
+		}
+
+		for w := 0; w < concPerTenant; w++ {
+			wg.Add(1)
+			go func(tIdx int, p *pgxpool.Pool) {
+				defer wg.Done()
+				ctx := context.Background()
+				var local []bench.QueryResult
+
+				for !stopped.Load() {
+					qStart := time.Now()
+					if rand.Intn(100) < 80 {
+						id := rand.Intn(maxID) + 1
+						var rID int
+						var rName string
+						var rBalance float64
+						err := p.QueryRow(ctx, "SELECT id, name, balance FROM accounts WHERE id = $1", id).Scan(&rID, &rName, &rBalance)
+						local = append(local, bench.QueryResult{At: qStart, Duration: time.Since(qStart), Err: err})
+					} else {
+						id := rand.Intn(maxID) + 1
+						delta := rand.Float64()*200 - 100
+						_, err := p.Exec(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", delta, id)
+						local = append(local, bench.QueryResult{At: qStart, Duration: time.Since(qStart), Err: err})
+					}
+				}
+
+				collectors[tIdx].mu.Lock()
+				collectors[tIdx].results = append(collectors[tIdx].results, local...)
+				collectors[tIdx].mu.Unlock()
+			}(t, pool)
+		}
+	}
+	wg.Wait()
+
+	totalDuration := time.Since(start)
+
+	// Convert collectors to tenantStats
+	tResults := make([]tenantStats, len(tenants))
+	for i, t := range tenants {
+		tResults[i] = tenantStats{Name: t, Results: collectors[i].results}
+	}
+
+	return computeScaleStats(tResults, pools, tenants, totalDuration, totalConc)
+}
+
+func computeScaleStats(tResults []tenantStats, pools []*pgxpool.Pool, tenants []string, totalDuration time.Duration, totalConc int) bench.BenchStats {
 	var allResults []bench.QueryResult
 	var totalErrors int
 	var tenantP50s []float64
@@ -183,66 +276,68 @@ func RunScale(proxyCfg bench.ConnConfig, params bench.BenchParams) {
 		allResults, totalDuration,
 	)
 
-	bench.PrintStats(overall)
-
 	// ── Fairness analysis ──
-	sort.Float64s(tenantP50s)
+	if len(tenantP50s) > 0 {
+		sort.Float64s(tenantP50s)
 
-	fastestP50 := time.Duration(tenantP50s[0]) * time.Microsecond
-	slowestP50 := time.Duration(tenantP50s[len(tenantP50s)-1]) * time.Microsecond
-	medianP50 := time.Duration(tenantP50s[len(tenantP50s)/2]) * time.Microsecond
+		fastestP50 := time.Duration(tenantP50s[0]) * time.Microsecond
+		slowestP50 := time.Duration(tenantP50s[len(tenantP50s)-1]) * time.Microsecond
+		medianP50 := time.Duration(tenantP50s[len(tenantP50s)/2]) * time.Microsecond
 
-	type ranked struct {
-		name string
-		p50  time.Duration
-	}
-	var ranking []ranked
-	for i := range tResults {
-		if pools[i] == nil {
-			continue
+		type ranked struct {
+			name string
+			p50  time.Duration
 		}
-		ranking = append(ranking, ranked{tResults[i].Name, tResults[i].Stats.LatencyP50})
-	}
-	sort.Slice(ranking, func(i, j int) bool { return ranking[i].p50 > ranking[j].p50 })
-
-	fairnessRatio := float64(slowestP50) / float64(fastestP50)
-
-	fmt.Println()
-	fmt.Println("╔═════════════════════════════════════════════════════════════╗")
-	fmt.Println("║  SCALE TEST RESULTS (100 TENANTS)                          ║")
-	fmt.Println("╠═════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Total Queries:     %-39d║\n", overall.Total)
-	fmt.Printf("║  Total Errors:      %-39d║\n", totalErrors)
-	fmt.Printf("║  Total Duration:    %-39s║\n", totalDuration.Round(time.Millisecond))
-	fmt.Printf("║  Overall QPS:       %-39.1f║\n", overall.QPS)
-	fmt.Printf("║  Overall p50:       %-39s║\n", bench.FmtDur(overall.LatencyP50))
-	fmt.Printf("║  Overall p95:       %-39s║\n", bench.FmtDur(overall.LatencyP95))
-	fmt.Printf("║  Overall p99:       %-39s║\n", bench.FmtDur(overall.LatencyP99))
-	fmt.Println("╠═════════════════════════════════════════════════════════════╣")
-	fmt.Println("║  TENANT FAIRNESS                                           ║")
-	fmt.Println("╠═════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Fastest tenant p50:  %-37s║\n", bench.FmtDur(fastestP50))
-	fmt.Printf("║  Median tenant p50:   %-37s║\n", bench.FmtDur(medianP50))
-	fmt.Printf("║  Slowest tenant p50:  %-37s║\n", bench.FmtDur(slowestP50))
-	fmt.Printf("║  Fairness ratio:      %-37s║\n", fmt.Sprintf("%.1fx (slowest/fastest)", fairnessRatio))
-	fmt.Println("╠═════════════════════════════════════════════════════════════╣")
-	fmt.Println("║  TOP 5 SLOWEST TENANTS                                     ║")
-	fmt.Println("╠═════════════════════════════════════════════════════════════╣")
-	for i := 0; i < 5 && i < len(ranking); i++ {
-		short := ranking[i].name
-		if len(short) > 20 {
-			short = short[len(short)-20:]
+		var ranking []ranked
+		for i := range tResults {
+			if pools[i] == nil {
+				continue
+			}
+			ranking = append(ranking, ranked{tResults[i].Name, tResults[i].Stats.LatencyP50})
 		}
-		fmt.Printf("║  #%d  %-20s  p50: %-23s║\n", i+1, short, bench.FmtDur(ranking[i].p50))
-	}
-	fmt.Println("╠═════════════════════════════════════════════════════════════╣")
+		sort.Slice(ranking, func(i, j int) bool { return ranking[i].p50 > ranking[j].p50 })
 
-	if fairnessRatio < 3.0 {
-		fmt.Println("║  ✅ FAIR — all tenants within 3x of each other              ║")
-	} else if fairnessRatio < 5.0 {
-		fmt.Println("║  ⚠️  MODERATE — some tenants slower than others              ║")
-	} else {
-		fmt.Println("║  ❌ UNFAIR — significant latency spread between tenants      ║")
+		fairnessRatio := float64(slowestP50) / float64(fastestP50)
+
+		fmt.Println()
+		fmt.Println("╔═════════════════════════════════════════════════════════════╗")
+		fmt.Println("║  SCALE TEST RESULTS (100 TENANTS)                          ║")
+		fmt.Println("╠═════════════════════════════════════════════════════════════╣")
+		fmt.Printf("║  Total Queries:     %-39d║\n", overall.Total)
+		fmt.Printf("║  Total Errors:      %-39d║\n", totalErrors)
+		fmt.Printf("║  Total Duration:    %-39s║\n", totalDuration.Round(time.Millisecond))
+		fmt.Printf("║  Overall QPS:       %-39.1f║\n", overall.QPS)
+		fmt.Printf("║  Overall p50:       %-39s║\n", bench.FmtDur(overall.LatencyP50))
+		fmt.Printf("║  Overall p95:       %-39s║\n", bench.FmtDur(overall.LatencyP95))
+		fmt.Printf("║  Overall p99:       %-39s║\n", bench.FmtDur(overall.LatencyP99))
+		fmt.Println("╠═════════════════════════════════════════════════════════════╣")
+		fmt.Println("║  TENANT FAIRNESS                                           ║")
+		fmt.Println("╠═════════════════════════════════════════════════════════════╣")
+		fmt.Printf("║  Fastest tenant p50:  %-37s║\n", bench.FmtDur(fastestP50))
+		fmt.Printf("║  Median tenant p50:   %-37s║\n", bench.FmtDur(medianP50))
+		fmt.Printf("║  Slowest tenant p50:  %-37s║\n", bench.FmtDur(slowestP50))
+		fmt.Printf("║  Fairness ratio:      %-37s║\n", fmt.Sprintf("%.1fx (slowest/fastest)", fairnessRatio))
+		fmt.Println("╠═════════════════════════════════════════════════════════════╣")
+		fmt.Println("║  TOP 5 SLOWEST TENANTS                                     ║")
+		fmt.Println("╠═════════════════════════════════════════════════════════════╣")
+		for i := 0; i < 5 && i < len(ranking); i++ {
+			short := ranking[i].name
+			if len(short) > 20 {
+				short = short[len(short)-20:]
+			}
+			fmt.Printf("║  #%d  %-20s  p50: %-23s║\n", i+1, short, bench.FmtDur(ranking[i].p50))
+		}
+		fmt.Println("╠═════════════════════════════════════════════════════════════╣")
+
+		if fairnessRatio < 3.0 {
+			fmt.Println("║  ✅ FAIR — all tenants within 3x of each other              ║")
+		} else if fairnessRatio < 5.0 {
+			fmt.Println("║  ⚠️  MODERATE — some tenants slower than others              ║")
+		} else {
+			fmt.Println("║  ❌ UNFAIR — significant latency spread between tenants      ║")
+		}
+		fmt.Println("╚═════════════════════════════════════════════════════════════╝")
 	}
-	fmt.Println("╚═════════════════════════════════════════════════════════════╝")
+
+	return overall
 }

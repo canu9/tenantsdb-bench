@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"tenantsdb-bench/bench"
 	"tenantsdb-bench/pg"
@@ -27,10 +28,12 @@ func main() {
 	directPass := cmd.String("direct-pass", "", "Direct DB password")
 	directDB := cmd.String("direct-db", "", "Direct DB name")
 
-	queries := cmd.Int("queries", 10000, "Number of queries to run")
+	queries := cmd.Int("queries", 10000, "Number of queries (count-based mode)")
 	concurrency := cmd.Int("concurrency", 10, "Concurrent connections")
 	warmup := cmd.Int("warmup", 100, "Warmup queries before measuring")
 	seedRows := cmd.Int("seed-rows", 10000, "Rows to insert for test data")
+	duration := cmd.Int("duration", 0, "Run duration in seconds (0 = use query count)")
+	runs := cmd.Int("runs", 1, "Number of runs for median calculation (1 = single run)")
 
 	cmd.Parse(os.Args[1:])
 
@@ -54,10 +57,12 @@ func main() {
 		fmt.Println("Options:")
 		fmt.Println("  -db            Database type: postgres, mysql, mongodb, redis (default: postgres)")
 		fmt.Println("  -test          Test type: overhead, throughput, multi, isolation, scale")
-		fmt.Println("  -queries       Number of queries (default: 10000)")
+		fmt.Println("  -queries       Number of queries (default: 10000, ignored if -duration set)")
 		fmt.Println("  -concurrency   Concurrent connections (default: 10)")
 		fmt.Println("  -warmup        Warmup queries (default: 100)")
 		fmt.Println("  -seed-rows     Test data rows (default: 10000)")
+		fmt.Println("  -duration      Run duration in seconds (default: 0 = count-based)")
+		fmt.Println("  -runs          Number of runs for median (default: 1)")
 		os.Exit(1)
 	}
 
@@ -82,6 +87,19 @@ func main() {
 		Concurrency: *concurrency,
 		Warmup:      *warmup,
 		SeedRows:    *seedRows,
+		Duration:    time.Duration(*duration) * time.Second,
+		Runs:        *runs,
+	}
+
+	if params.Duration > 0 {
+		fmt.Printf("Mode: time-based (%ds per run", *duration)
+	} else {
+		fmt.Printf("Mode: count-based (%d queries per run", params.Queries)
+	}
+	if params.Runs > 1 {
+		fmt.Printf(", %d runs, median reported)\n", params.Runs)
+	} else {
+		fmt.Println(", single run)")
 	}
 
 	switch *dbType {

@@ -67,14 +67,24 @@ func RunIsolation(proxyCfg bench.ConnConfig, params bench.BenchParams) {
 	maxID := params.SeedRows
 	victimConc := 5
 
-	// ── Phase 1: Victim alone ──
-	fmt.Println("\n── Phase 1: Victim alone (no noise) ──")
-	baselineStats := RunQueries(victimPool, bench.BenchParams{
+	victimParams := bench.BenchParams{
 		Queries:     params.Queries,
 		Concurrency: victimConc,
 		Warmup:      params.Warmup,
 		SeedRows:    params.SeedRows,
-	}, "Victim ALONE")
+		Duration:    params.Duration,
+	}
+
+	// ── Phase 1: Victim alone ──
+	fmt.Println("\n── Phase 1: Victim alone (no noise) ──")
+	var baselineStats bench.BenchStats
+	if params.Runs > 1 {
+		baselineStats = bench.RunMultiple(params.Runs, "Victim ALONE", func(run int) bench.BenchStats {
+			return PickRunner(victimPool, victimParams, "Victim ALONE")
+		})
+	} else {
+		baselineStats = PickRunner(victimPool, victimParams, "Victim ALONE")
+	}
 	bench.PrintStats(baselineStats)
 
 	// ── Phase 2: Victim under noise ──
@@ -108,12 +118,14 @@ func RunIsolation(proxyCfg bench.ConnConfig, params bench.BenchParams) {
 	fmt.Println("  ✓ Noise running (9 tenants × 5 concurrent = 45 writers)")
 
 	fmt.Println("\n── Measuring victim under noise ──")
-	noiseStats := RunQueries(victimPool, bench.BenchParams{
-		Queries:     params.Queries,
-		Concurrency: victimConc,
-		Warmup:      params.Warmup,
-		SeedRows:    params.SeedRows,
-	}, "Victim UNDER NOISE")
+	var noiseStats bench.BenchStats
+	if params.Runs > 1 {
+		noiseStats = bench.RunMultiple(params.Runs, "Victim UNDER NOISE", func(run int) bench.BenchStats {
+			return PickRunner(victimPool, victimParams, "Victim UNDER NOISE")
+		})
+	} else {
+		noiseStats = PickRunner(victimPool, victimParams, "Victim UNDER NOISE")
+	}
 	bench.PrintStats(noiseStats)
 
 	close(stopNoise)
