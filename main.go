@@ -4,30 +4,29 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"tenantsdb-bench/bench"
+	"tenantsdb-bench/pg"
 )
 
 func main() {
 	cmd := flag.NewFlagSet("bench", flag.ExitOnError)
 
-	// Test selection
 	dbType := cmd.String("db", "postgres", "Database type: postgres, mysql, mongodb, redis")
-	testType := cmd.String("test", "overhead", "Test type: overhead, throughput, isolation")
+	testType := cmd.String("test", "overhead", "Test type: overhead, throughput, multi, isolation, scale")
 
-	// Proxy connection (through TenantsDB)
-	proxyHost := cmd.String("proxy-host", "", "Proxy host (e.g., 192.168.60.13)")
-	proxyPort := cmd.Int("proxy-port", 0, "Proxy port (e.g., 30432)")
-	proxyUser := cmd.String("proxy-user", "", "Project ID (e.g., tdb_24cbcee9)")
-	proxyPass := cmd.String("proxy-pass", "", "Proxy password (e.g., tdb_7288175b98bafbae)")
-	proxyDB := cmd.String("proxy-db", "", "Database name (e.g., bench_pg__bench01)")
+	proxyHost := cmd.String("proxy-host", "", "Proxy host")
+	proxyPort := cmd.Int("proxy-port", 0, "Proxy port")
+	proxyUser := cmd.String("proxy-user", "", "Project ID")
+	proxyPass := cmd.String("proxy-pass", "", "Proxy password")
+	proxyDB := cmd.String("proxy-db", "", "Database name")
 
-	// Direct connection (bypass proxy)
-	directHost := cmd.String("direct-host", "", "Direct DB host (e.g., 192.168.60.12)")
-	directPort := cmd.Int("direct-port", 0, "Direct DB port (e.g., 5432)")
+	directHost := cmd.String("direct-host", "", "Direct DB host")
+	directPort := cmd.Int("direct-port", 0, "Direct DB port")
 	directUser := cmd.String("direct-user", "", "Direct DB user")
 	directPass := cmd.String("direct-pass", "", "Direct DB password")
 	directDB := cmd.String("direct-db", "", "Direct DB name")
 
-	// Benchmark parameters
 	queries := cmd.Int("queries", 10000, "Number of queries to run")
 	concurrency := cmd.Int("concurrency", 10, "Concurrent connections")
 	warmup := cmd.Int("warmup", 100, "Warmup queries before measuring")
@@ -36,7 +35,7 @@ func main() {
 	cmd.Parse(os.Args[1:])
 
 	if *proxyHost == "" {
-		fmt.Println("Usage: tenantsdb-bench [flags]")
+		fmt.Println("Usage: tdb-bench [flags]")
 		fmt.Println()
 		fmt.Println("Required flags:")
 		fmt.Println("  -proxy-host    Proxy host")
@@ -54,7 +53,7 @@ func main() {
 		fmt.Println()
 		fmt.Println("Options:")
 		fmt.Println("  -db            Database type: postgres, mysql, mongodb, redis (default: postgres)")
-		fmt.Println("  -test          Test type: overhead, throughput, isolation (default: overhead)")
+		fmt.Println("  -test          Test type: overhead, throughput, multi, isolation, scale")
 		fmt.Println("  -queries       Number of queries (default: 10000)")
 		fmt.Println("  -concurrency   Concurrent connections (default: 10)")
 		fmt.Println("  -warmup        Warmup queries (default: 100)")
@@ -62,7 +61,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	proxyCfg := ConnConfig{
+	proxyCfg := bench.ConnConfig{
 		Host:     *proxyHost,
 		Port:     *proxyPort,
 		User:     *proxyUser,
@@ -70,7 +69,7 @@ func main() {
 		Database: *proxyDB,
 	}
 
-	directCfg := ConnConfig{
+	directCfg := bench.ConnConfig{
 		Host:     *directHost,
 		Port:     *directPort,
 		User:     *directUser,
@@ -78,7 +77,7 @@ func main() {
 		Database: *directDB,
 	}
 
-	params := BenchParams{
+	params := bench.BenchParams{
 		Queries:     *queries,
 		Concurrency: *concurrency,
 		Warmup:      *warmup,
@@ -93,15 +92,15 @@ func main() {
 				fmt.Println("Error: overhead test requires -direct-* flags for comparison")
 				os.Exit(1)
 			}
-			RunPostgresOverhead(proxyCfg, directCfg, params)
+			pg.RunOverhead(proxyCfg, directCfg, params)
 		case "throughput":
-			RunPostgresThroughput(proxyCfg, params)
+			pg.RunThroughput(proxyCfg, params)
 		case "multi":
-			RunPostgresMultiTenant(proxyCfg, params)
+			pg.RunMultiTenant(proxyCfg, params)
 		case "isolation":
-			RunPostgresIsolation(proxyCfg, params)
+			pg.RunIsolation(proxyCfg, params)
 		case "scale":
-			RunPostgresScale(proxyCfg, params)			
+			pg.RunScale(proxyCfg, params)
 		default:
 			fmt.Printf("Unknown test type: %s\n", *testType)
 			os.Exit(1)
