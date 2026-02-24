@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"tenantsdb-bench/bench"
+	"tenantsdb-bench/my"
 	"tenantsdb-bench/pg"
 )
 
@@ -119,6 +120,26 @@ func main() {
 			pg.RunIsolation(proxyCfg, params)
 		case "scale":
 			pg.RunScale(proxyCfg, params)
+		default:
+			fmt.Printf("Unknown test type: %s\n", *testType)
+			os.Exit(1)
+		}
+	case "mysql":
+		switch *testType {
+		case "overhead":
+			if *directHost == "" {
+				fmt.Println("Error: overhead test requires -direct-* flags for comparison")
+				os.Exit(1)
+			}
+			my.RunOverhead(proxyCfg, directCfg, params)
+		case "throughput":
+			my.RunThroughput(proxyCfg, params)
+		case "multi":
+			my.RunMultiTenant(proxyCfg, params)
+		case "isolation":
+			my.RunIsolation(proxyCfg, params)
+		case "scale":
+			my.RunScale(proxyCfg, params)
 		default:
 			fmt.Printf("Unknown test type: %s\n", *testType)
 			os.Exit(1)
