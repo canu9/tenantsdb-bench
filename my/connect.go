@@ -15,7 +15,7 @@ import (
 )
 
 func Connect(c bench.ConnConfig) (*sql.DB, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&interpolateParams=true&allowCleartextPasswords=true",
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&interpolateParams=true&allowCleartextPasswords=true&timeout=30s",
 		c.User, c.Password, c.Host, c.Port, c.Database)
 
 	db, err := sql.Open("mysql", dsn)
