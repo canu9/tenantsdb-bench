@@ -61,7 +61,6 @@ func SeedData(db *sql.DB, rows int) error {
 		return fmt.Errorf("create table: %w", err)
 	}
 
-	var count int
 	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM accounts").Scan(&count)
 	if err != nil {
 		return fmt.Errorf("seed check: %w", err)
