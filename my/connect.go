@@ -39,7 +39,17 @@ func Connect(c bench.ConnConfig) (*sql.DB, error) {
 func SeedData(db *sql.DB, rows int) error {
 	ctx := context.Background()
 
-	// Create table if not exists
+	// Check if table already exists and seeded
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM accounts").Scan(&count); err == nil {
+		if count >= rows {
+			fmt.Printf("  Data already seeded (%d rows)\n", count)
+			return nil
+		}
+		fmt.Printf("  Table exists with %d rows, seeding more...\n", count)
+	}
+
+	// Create table if not exists (only works on direct connections, blocked by proxy DDL guard)
 	_, err := db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS accounts (
 			id INT AUTO_INCREMENT PRIMARY KEY,
